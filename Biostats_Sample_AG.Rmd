@@ -1,0 +1,158 @@
+---
+title: "Biostats-Sample"
+author: "Alexis Garduno"
+date: '2023-08-04'
+output:
+  pdf_document: default
+  html_document: default
+---
+##Description: To perform exact matching on a select group of subjects with a healthcare encounter.
+##Input: Encounter_Table, Patient_Table
+##Output: Median Age (years) at Index for Exposed Cohort; Aggregate Time at Risk for Exhosed Cohort (person-days)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(lubridate)
+```
+
+##Load tables
+```{r cars}
+path <- 'C:/Users/Alexis Garduno/iCloudDrive/Documents/2022-2023/Personal/Interview/Graticule/biostats-sample'
+encounter_table <- read.csv(paste0(path,'/encounter_table.csv'))
+patient_table <- read.csv(paste0(path,'/patient_table.csv'))
+
+summary(encounter_table)
+summary(patient_table)
+
+encounter_table <- encounter_table %>% mutate(across(ends_with("date"), ~as.Date(.x, format = "%Y-%m-%d")))
+encounter_table$exposure <- as.numeric(as.logical(encounter_table$exposure))
+encounter_table$outcome <- as.numeric(as.logical(encounter_table$outcome))
+encounter_table$patientid <- as.factor(encounter_table$patientid)
+
+patient_table <- patient_table %>% mutate(across(ends_with("date"), ~ as.Date(.x, format = "%Y-%m-%d")))
+patient_table[,c('patientid','gender')] <- lapply(patient_table[,c('patientid','gender')] , factor)
+
+
+summary(encounter_table)
+summary(patient_table)
+head(encounter_table)
+head(patient_table)
+```
+##Merge the dataset and check range
+```{r cars}
+#merged datasets; checked that all ids matched between datasets
+dim(patient_table); dim(encounter_table)
+patient_table2 <- merge(patient_table,encounter_table,by='patientid',all=FALSE)
+#calculate age
+patient_table2$age <- round(as.numeric(patient_table2$encounterdate - patient_table2$birthdate)/365.25,0) 
+dim(patient_table2)
+```
+
+##Exact Matching
+##For initialization, begin matching on the second week of data from July 1st to ensure that we have observation on participants showing no prior exposure.
+```{r cars}
+##less than one year of data; identify week using base package (assuming ISO week is not needed)
+patient_table2 <- patient_table2 %>% mutate(encounter_wk=strftime(encounterdate,format = "%W"))
+
+#examine count of exposed and unexposed
+table(patient_table2$exposure)
+
+#generate a dataframe with list of exposed subjects
+patient_table2_exp <- patient_table2[patient_table2$exposure==1,]
+#identify the earliest exposure date for participants
+patient_table2_exp2 <-  patient_table2_exp %>% group_by(patientid) %>% summarise_at(vars(encounterdate), list(min = min))
+
+#unexposed records
+patient_table2_noexp <- patient_table2[patient_table2$exposure==0,]
+
+#for unexposed records, merge back the date of exposure
+copy_exp <- patient_table2_exp2
+colnames(copy_exp) <- c('patientid','exp_encounterdate')
+#merge back and filter
+patient_table2_noexp2 <- merge(patient_table2_noexp,copy_exp,by='patientid',all.x=TRUE)
+dim(patient_table2_noexp2)
+#remove hospital encounters where exposed prior to unexposed record
+patient_table2_noexp2 <- patient_table2_noexp2[patient_table2_noexp2$encounterdate < patient_table2_noexp2$exp_encounterdate,]
+dim(patient_table2_noexp2)
+
+#empty arrays for exposed, unexposed
+exposed_arr <- c()
+unexposed_arr <- c()
+i=0
+while(nrow(patient_table2_exp) != 0) {
+ exposed <- patient_table2_exp[1,]
+ unexposed <- merge(exposed,patient_table2_noexp2,by=c('encounter_wk','gender'))
+ #keep first unexposed person
+ if (nrow(unexposed) > 0) {
+   unexposed_select <- unexposed[1,]
+   unexposed_name <- unexposed_select$patientid.y
+   #remove their records from the unexposed dataset
+   patient_table2_noexp2 <- subset(patient_table2_noexp2,patientid!=unexposed_name)
+   print('Total Number of Unexposed Records Remaining')
+   print(dim(patient_table2_noexp2))
+   #remove individual from the exposed group
+   exposed_name <- exposed$patientid
+   patient_table2_exp <- subset(patient_table2_exp,patientid!=exposed_name)
+   print('Total Number of Exposed Recordss Remaining')
+   print(dim(patient_table2_exp))
+   #stack dataframe
+   if (i==0) {
+      exposed_arr <- exposed
+      unexposed_arr <- unexposed_select
+   } else {
+      exposed_arr <- rbind(exposed_arr,exposed)
+      unexposed_arr <- rbind(unexposed_arr,unexposed_select)
+   }
+   i = i+1
+ } else {
+   patient_table2_exp <- patient_table2_exp[-c(1),]
+ }
+ rm(exposed);rm(unexposed)
+}
+
+```
+#Verify Deduplicated Sample
+```{r cars}
+any(duplicated(exposed_arr$patientid))
+any(duplicated(unexposed_arr$patientid))
+dim(exposed_arr)
+#only 23 were matched based on the given criteria
+```
+
+#Median Age at Index in Exposed Cohort
+
+The median age at index of the exposed cohort is August 6th 2022; the 95% CI for this date is shown 2023-07-21 to 2021-08-21.
+
+```{r cars}
+#calculate median index date
+print('Median Index Date')
+med <- median(exposed_arr$encounterdate)
+med
+#Standard Deviation
+sd <- sd(exposed_arr$encounterdate) #days?
+#Assume that this is the total number of days
+upper_95ci <- med + 1.96*sd
+lower_95ci <- med - 1.96*sd
+paste0(paste0('95%CI: ',upper_95ci,' to ', lower_95ci))
+```
+
+#Total Time at Risk for Exposed Cohort (Person-Days)
+
+The total time at risk for the exposed cohort (n=23) is 4910 days.
+
+We will assume that an absence of a death record means that they are still under observation.
+```{r cars}
+study_end <- rep(as.Date('2022/12/31'),dim(exposed_arr)[1])
+exposed_arr2 <- cbind(exposed_arr,study_end)
+end_obs <- coalesce(exposed_arr2$deceaseddate,exposed_arr2$study_end)
+exposed_arr2 <- cbind(exposed_arr2,end_obs) #none of the dates are before dec31st
+#time at risk = index to outcome or death
+#calculate days from the study index date to study end; assuming no outcome from index date to end of study period in this cohort
+exposed_arr2$time_atrisk <- exposed_arr2$study_end - exposed_arr2$encounterdate
+##total person-time at-risk
+total_atrisk <- sum(exposed_arr2$time_atrisk)
+total_atrisk
+```
+
+
